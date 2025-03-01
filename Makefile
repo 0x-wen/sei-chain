@@ -74,6 +74,7 @@ all: lint install
 install: go.sum
 		go install $(BUILD_FLAGS) ./cmd/seid
 
+# 用于检测并发问题
 install-with-race-detector: go.sum
 		go install -race $(BUILD_FLAGS) ./cmd/seid
 
@@ -90,6 +91,7 @@ go.sum: go.mod
 		@echo "--> Ensure dependencies have not been modified"
 		@go mod verify
 
+# 运行静态代码分析（golangci-lint）、检查代码格式（gofmt）、验证依赖。
 lint:
 	golangci-lint run
 	find . -name '*.go' -type f -not -path "./vendor*" -not -path "*.git*" | xargs gofmt -d -s
@@ -141,14 +143,18 @@ build-rpc-node:
 # Run a single node docker container
 run-local-node: kill-sei-node build-docker-node
 	@rm -rf $(PROJECT_HOME)/build/generated
-	docker run --rm \
+	docker run -d \
 	--name sei-node \
-	--network host \
 	--user="$(shell id -u):$(shell id -g)" \
 	-v $(PROJECT_HOME):/sei-protocol/sei-chain:Z \
 	-v $(GO_PKG_PATH)/mod:/root/go/pkg/mod:Z \
 	-v $(shell go env GOCACHE):/root/.cache/go-build:Z \
 	--platform linux/x86_64 \
+	-p 26657:26657 \
+	-p 17171:7171 \
+	-p 19090:9090 \
+	-p 19091:9091 \
+	-p 8545:8545 \
 	sei-chain/localnode
 .PHONY: run-local-node
 
