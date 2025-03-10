@@ -238,6 +238,14 @@ func (b Backend) ConvertBlockNumber(bn rpc.BlockNumber) int64 {
 	switch blockNum {
 	case rpc.SafeBlockNumber.Int64(), rpc.FinalizedBlockNumber.Int64(), rpc.LatestBlockNumber.Int64():
 		blockNum = b.ctxProvider(LatestCtxHeight).BlockHeight()
+	case rpc.EarliestBlockNumber.Int64():
+		genesisRes, err := b.tmClient.Genesis(context.Background())
+		if err != nil {
+			panic("could not get genesis info from tendermint")
+		}
+		blockNum = genesisRes.Genesis.InitialHeight
+	case rpc.PendingBlockNumber.Int64():
+		panic("tracing on pending block is not supported")
 	}
 	return blockNum
 }
@@ -269,7 +277,7 @@ func (b Backend) BlockByNumber(ctx context.Context, bn rpc.BlockNumber) (*ethtyp
 			}
 		}
 	}
-	header := b.getHeader(big.NewInt(bn.Int64()))
+	header := b.getHeader(big.NewInt(blockNum))
 	block := &ethtypes.Block{
 		Header_: header,
 		Txs:     txs,
@@ -331,7 +339,7 @@ func (b *Backend) StateAtTransaction(ctx context.Context, block *ethtypes.Block,
 	}
 	reqBeginBlock := tmBlock.Block.ToReqBeginBlock(res.Validators)
 	reqBeginBlock.Simulate = true
-	sdkCtx := b.ctxProvider(prevBlockHeight)
+	sdkCtx := b.ctxProvider(prevBlockHeight).WithBlockHeight(blockNumber).WithBlockTime(tmBlock.Block.Time)
 	_ = b.app.BeginBlock(sdkCtx, reqBeginBlock)
 	blockContext, err := b.keeper.GetVMBlockContext(sdkCtx, core.GasPool(b.RPCGasCap()))
 	if err != nil {
@@ -377,7 +385,7 @@ func (b *Backend) GetEVM(_ context.Context, msg *core.Message, stateDB vm.StateD
 	if blockCtx == nil {
 		blockCtx, _ = b.keeper.GetVMBlockContext(b.ctxProvider(LatestCtxHeight).WithIsEVM(true).WithEVMEntryViaWasmdPrecompile(wasmd.IsWasmdCall(msg.To)), core.GasPool(b.RPCGasCap()))
 	}
-	return vm.NewEVM(*blockCtx, txContext, stateDB, b.ChainConfig(), *vmConfig)
+	return vm.NewEVM(*blockCtx, txContext, stateDB, b.ChainConfig(), *vmConfig, b.keeper.CustomPrecompiles())
 }
 
 func (b *Backend) CurrentHeader() *ethtypes.Header {
@@ -431,6 +439,10 @@ func (b *Backend) getHeader(blockNumber *big.Int) *ethtypes.Header {
 		header.Time = uint64(block.Block.Header.Time.Unix())
 	}
 	return header
+}
+
+func (b *Backend) GetCustomPrecompiles() map[common.Address]vm.PrecompiledContract {
+	return b.keeper.CustomPrecompiles()
 }
 
 type Engine struct {

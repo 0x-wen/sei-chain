@@ -292,7 +292,7 @@ func (am AppModule) BeginBlock(ctx sdk.Context, _ abci.RequestBeginBlock) {
 				panic(err)
 			}
 			statedb := state.NewDBImpl(ctx, am.keeper, false)
-			vmenv := vm.NewEVM(*blockCtx, vm.TxContext{}, statedb, types.DefaultChainConfig().EthereumConfig(am.keeper.ChainID(ctx)), vm.Config{})
+			vmenv := vm.NewEVM(*blockCtx, vm.TxContext{}, statedb, types.DefaultChainConfig().EthereumConfig(am.keeper.ChainID(ctx)), vm.Config{}, am.keeper.CustomPrecompiles())
 			core.ProcessBeaconBlockRoot(*beaconRoot, vmenv, statedb)
 			_, err = statedb.Finalize()
 			if err != nil {
@@ -342,7 +342,9 @@ func (am AppModule) EndBlock(ctx sdk.Context, req abci.RequestEndBlock) []abci.V
 		}
 		idx := int(deferredInfo.TxIndex)
 		coinbaseAddress := state.GetCoinbaseAddress(idx)
-		balance := am.keeper.BankKeeper().SpendableCoins(ctx, coinbaseAddress).AmountOf(denom)
+		useiBalance := am.keeper.BankKeeper().GetBalance(ctx, coinbaseAddress, denom).Amount
+		lockedUseiBalance := am.keeper.BankKeeper().LockedCoins(ctx, coinbaseAddress).AmountOf(denom)
+		balance := useiBalance.Sub(lockedUseiBalance)
 		weiBalance := am.keeper.BankKeeper().GetWeiBalance(ctx, coinbaseAddress)
 		if !balance.IsZero() || !weiBalance.IsZero() {
 			if err := am.keeper.BankKeeper().SendCoinsAndWei(ctx, coinbaseAddress, coinbase, balance, weiBalance); err != nil {
