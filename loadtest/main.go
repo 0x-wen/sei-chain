@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -33,13 +34,17 @@ import (
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 
 	"github.com/sei-protocol/sei-chain/app"
 	"github.com/sei-protocol/sei-chain/utils/metrics"
+	cttypes "github.com/sei-protocol/sei-chain/x/confidentialtransfers/types"
 	tokenfactorytypes "github.com/sei-protocol/sei-chain/x/tokenfactory/types"
+
+	ctutils "github.com/sei-protocol/sei-chain/x/confidentialtransfers/utils"
 )
 
 var TestConfig EncodingConfig
@@ -96,9 +101,10 @@ func deployEvmContract(scriptPath string, config *Config) (common.Address, error
 	if err != nil {
 		return common.Address{}, err
 	}
-	return common.HexToAddress(out.String()), nil
+	return common.HexToAddress(strings.TrimSpace(out.String())), nil
 }
 
+//nolint:gosec
 func deployEvmContracts(config *Config) {
 	config.EVMAddresses = &EVMAddresses{}
 	if config.ContainsAnyMessageTypes(ERC20) {
@@ -119,32 +125,25 @@ func deployEvmContracts(config *Config) {
 		}
 		config.EVMAddresses.ERC721 = erc721
 	}
-}
-
-//nolint:gosec
-func deployUniswapContracts(client *LoadTestClient, config *Config) {
-	config.EVMAddresses = &EVMAddresses{}
 	if config.ContainsAnyMessageTypes(UNIV2) {
+		//TODO: this really should use `deployEvmContract`
 		fmt.Println("Deploying Uniswap contracts")
 		cmd := exec.Command("loadtest/contracts/deploy_univ2.sh", config.EVMRpcEndpoint())
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		err := cmd.Run()
-		fmt.Println("script output: ", out.String())
 		if err != nil {
 			panic("deploy_univ2.sh failed with error: " + err.Error())
 		}
 		UniV2SwapperRe := regexp.MustCompile(`Swapper Address: "(\w+)"`)
 		match := UniV2SwapperRe.FindStringSubmatch(out.String())
 		uniV2SwapperAddress := common.HexToAddress(match[1])
-		fmt.Println("Found UniV2Swapper Address: ", uniV2SwapperAddress.String())
-		for _, txClient := range client.EvmTxClients {
-			txClient.evmAddresses.UniV2Swapper = uniV2SwapperAddress
-		}
+		config.EVMAddresses.UniV2Swapper = uniV2SwapperAddress
 	}
 }
 
 func run(config *Config) {
+	config.EVMAddresses = &EVMAddresses{}
 	// Start metrics collector in another thread
 	metricsServer := MetricsServer{}
 	go metricsServer.StartMetricsClient(*config)
@@ -152,7 +151,12 @@ func run(config *Config) {
 	client := NewLoadTestClient(*config)
 	client.SetValidators()
 	deployEvmContracts(config)
-	deployUniswapContracts(client, config)
+
+	// initialize clients with addresses on clients
+	for _, txClient := range client.EvmTxClients {
+		txClient.evmAddresses = config.EVMAddresses
+	}
+
 	startLoadtestWorkers(client, *config)
 	runEvmQueries(*config)
 }
@@ -160,7 +164,6 @@ func run(config *Config) {
 // starts loadtest workers. If config.Constant is true, then we don't gather loadtest results and let producer/consumer
 // workers continue running. If config.Constant is false, then we will gather load test results in a file
 func startLoadtestWorkers(client *LoadTestClient, config Config) {
-	fmt.Printf("Starting loadtest workers\n")
 	configString, _ := json.Marshal(config)
 	fmt.Printf("Running with \n %s \n", string(configString))
 
@@ -512,6 +515,93 @@ func (c *LoadTestClient) generateMessage(key cryptotypes.PrivKey, msgType string
 			Contract: contract,
 			Msg:      wasmtypes.RawContractMessage([]byte(fmt.Sprintf("{\"test_occ_parallelism\":{\"value\": %d}}", value))),
 		}}
+	case ConfidentialTransfersDeposit:
+		depositMsg := &cttypes.MsgDeposit{
+			FromAddress: sdk.AccAddress(key.PubKey().Address()).String(),
+			Denom:       CtDefaultDenom,
+			Amount:      1,
+		}
+		msgs = append(msgs, depositMsg)
+	case ConfidentialTransfersWithdraw:
+		senderPrivHex := hex.EncodeToString(key.Bytes())
+		senderEcdsaKey, _ := crypto.HexToECDSA(senderPrivHex)
+		address := sdk.AccAddress(key.PubKey().Address()).String()
+		account := c.getCtAccount(address, CtDefaultDenom)
+		withdraw, err := cttypes.NewWithdraw(
+			*senderEcdsaKey,
+			account.AvailableBalance,
+			CtDefaultDenom,
+			sdk.AccAddress(key.PubKey().Address()).String(),
+			account.DecryptableAvailableBalance,
+			big.NewInt(1),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("error for senderAddress %s: %s\n", address, err.Error()))
+		}
+		withdrawMsg := cttypes.NewMsgWithdrawProto(withdraw)
+		msgs = append(msgs, withdrawMsg)
+	case ConfidentialTransfersApplyPendingBalance:
+		senderPrivHex := hex.EncodeToString(key.Bytes())
+		senderEcdsaKey, _ := crypto.HexToECDSA(senderPrivHex)
+		account := c.getCtAccount(sdk.AccAddress(key.PubKey().Address()).String(), CtDefaultDenom)
+
+		address := sdk.AccAddress(key.PubKey().Address()).String()
+		applyPendingBalance, err := cttypes.NewApplyPendingBalance(
+			*senderEcdsaKey,
+			address,
+			CtDefaultDenom,
+			account.DecryptableAvailableBalance,
+			account.PendingBalanceCreditCounter,
+			account.AvailableBalance,
+			account.PendingBalanceLo,
+			account.PendingBalanceHi)
+		if err != nil {
+			panic(fmt.Sprintf("error for senderAddress %s: %s\n", address, err.Error()))
+		}
+
+		applyPendingBalanceMsg := cttypes.NewMsgApplyPendingBalanceProto(applyPendingBalance)
+		msgs = append(msgs, applyPendingBalanceMsg)
+	case ConfidentialTransfersTransfer:
+		accountKeys := c.AccountKeys
+		// get a random key for receiver and if it's same as the current key, get another one
+		if len(accountKeys) < 2 {
+			panic("Need at least 2 accounts to transfer")
+		}
+		receiverKey := accountKeys[rand.Intn(len(accountKeys))]
+		for receiverKey.PubKey().Equals(key.PubKey()) {
+			receiverKey = accountKeys[rand.Intn(len(accountKeys))]
+		}
+
+		senderPrivHex := hex.EncodeToString(key.Bytes())
+		senderEcdsaKey, _ := crypto.HexToECDSA(senderPrivHex)
+		receiverPrivHex := hex.EncodeToString(receiverKey.Bytes())
+		receiverEcdsaKey, _ := crypto.HexToECDSA(receiverPrivHex)
+
+		receiverKeyPair, _ := ctutils.GetElGamalKeyPair(*receiverEcdsaKey, CtDefaultDenom)
+		senderAddress := sdk.AccAddress(key.PubKey().Address()).String()
+		receiverAddress := sdk.AccAddress(receiverKey.PubKey().Address()).String()
+		senderAccount := c.getCtAccount(senderAddress, CtDefaultDenom)
+		if senderAccount == nil {
+			panic(fmt.Sprintf("Sender account not found for address %s\n", senderAddress))
+		}
+
+		transfer, err := cttypes.NewTransfer(
+			senderEcdsaKey,
+			senderAddress,
+			receiverAddress,
+			CtDefaultDenom,
+			senderAccount.DecryptableAvailableBalance,
+			senderAccount.AvailableBalance,
+			1,
+			&receiverKeyPair.PublicKey,
+			[]cttypes.AuditorInput{},
+		)
+		if err != nil {
+			panic(fmt.Sprintf("error for address %s: %s\n", senderAddress, err.Error()))
+		}
+
+		transferMsg := cttypes.NewMsgTransferProto(transfer)
+		msgs = append(msgs, transferMsg)
 	default:
 		fmt.Printf("Unrecognized message type %s", msgType)
 	}
@@ -520,6 +610,17 @@ func (c *LoadTestClient) generateMessage(key cryptotypes.PrivKey, msgType string
 		return msgs, true, signer, gas, int64(fee)
 	}
 	return msgs, false, signer, gas, int64(fee)
+}
+
+func (c *LoadTestClient) getCtAccount(address string, denom string) *cttypes.Account {
+	getCtAccountReq := &cttypes.GetCtAccountRequest{
+		Address: address,
+		Denom:   denom,
+	}
+	getCtAccountRes, _ := c.CtQueryClient.GetCtAccount(context.Background(), getCtAccountReq)
+	ctAccount := getCtAccountRes.GetAccount()
+	account, _ := ctAccount.FromProto()
+	return account
 }
 
 func (c *LoadTestClient) generateStakingMsg(delegatorAddr string, chosenValidator string, srcAddr string) sdk.Msg {

@@ -175,12 +175,12 @@ func formatParam(p interface{}) string {
 		}
 		return fmt.Sprintf("{%s}", strings.Join(kvs, ","))
 	default:
-		panic("did not match on type")
+		return fmt.Sprintf("%s", p)
 	}
 }
 
 func signAndEncodeTx(txData ethtypes.TxData, mnemonic string) []byte {
-	signed := signTxWithMnemonic(txData, mnemonic1)
+	signed := signTxWithMnemonic(txData, mnemonic)
 	var typedTx proto.Message
 	switch txData.(type) {
 	case *ethtypes.LegacyTx:
@@ -203,7 +203,7 @@ func signAndEncodeTx(txData ethtypes.TxData, mnemonic string) []byte {
 }
 
 func signAndEncodeCosmosTx(msg sdk.Msg, mnemonic string, acctN uint64, seq uint64) []byte {
-	tx := signCosmosTxWithMnemonic(msg, mnemonic1, acctN, seq)
+	tx := signCosmosTxWithMnemonic(msg, mnemonic, acctN, seq)
 	txBz, _ := testkeeper.EVMTestApp.GetTxConfig().TxEncoder()(tx)
 	return txBz
 }
